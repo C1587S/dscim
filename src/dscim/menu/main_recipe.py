@@ -484,34 +484,40 @@ class MainRecipe(StackedDamages, ABC):
 
     @cachedproperty
     @save(name="damage_function_points")
-    def damage_function_points(self) -> pd.DataFrame:
+    def damage_function_points(self) -> xr.Dataset:
         """Global damages by RCP/GCM or SLR
 
         Returns
         --------
-            pd.DataFrame
+            xr.Dataset
         """
-        df = self.global_damages_calculation()
+        df = self.damages_calculation(geography=self.geography)
 
-        if "slr" in df.columns:
-            df = df.merge(self.climate.gmsl, on=["year", "slr"])
-        if "gcm" in df.columns:
-            df = df.merge(self.climate.gmst, on=["year", "gcm", "rcp"])
+        climate_vars = []
+        if "slr" in df.coords:
+            climate_vars.append(self.climate.gmsl.set_index(['slr','year']).to_xarray())
+        if "gcm" in df.coords:
+            climate_vars.append(self.climate.gmst.set_index(['gcm','rcp','year']).to_xarray())
+
+        if climate_vars:
+            climate_ds = xr.merge(climate_vars)
+        else:
+            climate_ds = None
 
         # removing illegal combinations from estimation
-        if any([i in df.ssp.unique() for i in ["SSP1", "SSP5"]]):
+        if any([i in df.ssp.values for i in ["SSP1", "SSP5"]]):
             self.logger.info("Dropping illegal model combinations.")
-            for var in [i for i in df.columns if i in ["anomaly", "gmsl"]]:
-                df.loc[
-                    ((df.ssp == "SSP1") & (df.rcp == "rcp85"))
-                    | ((df.ssp == "SSP5") & (df.rcp == "rcp45")),
-                    var,
-                ] = np.nan
+            df = xr.where(((df.ssp == "SSP1") & (df.rcp == "rcp85"))
+                | ((df.ssp == "SSP5") & (df.rcp == "rcp45")), np.nan, df)
 
         # agriculture lacks ACCESS0-1/rcp85 combo
         if "agriculture" in self.sector:
             self.logger.info("Dropping illegal model combinations for agriculture.")
-            df.loc[(df.gcm == "ACCESS1-0") & (df.rcp == "rcp85"), "anomaly"] = np.nan
+            if climate_ds is not None:
+                climate_ds = xr.where((climate_ds.gcm == "ACCESS1-0") & (climate_ds.rcp == "rcp85"), np.nan, climate_ds)
+
+        if climate_ds is not None:
+            df = xr.merge([df, climate_ds]).sel(year = df.year)
 
         return df
 
