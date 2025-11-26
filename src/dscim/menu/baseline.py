@@ -1,3 +1,4 @@
+import xarray as xr
 from dscim.menu.main_recipe import MainRecipe
 
 
@@ -16,6 +17,46 @@ class Baseline(MainRecipe):
     def global_damages_calculation(self):
         """Call global damages"""
         return self.adding_up_damages.to_dataframe("damages").reset_index()
+
+    def damages_calculation(self, geography) -> xr.Dataset:
+        """Aggregate damages to country/region level
+
+        Returns
+        --------
+            xr.Dataset with damages variable
+        """
+        self.logger.info(f"Calculating damages for geography: {geography}")
+
+        # Get damages from adding_up (returns as xarray)
+        dams_collapse = self.adding_up_damages
+
+        if geography == "ir":
+            pass
+        elif geography == "country":
+            territories = []
+            mapping_dict = {}
+            for ii, row in self.countries_mapping.iterrows():
+                mapping_dict[row["ISO"]] = row["MatchedISO"]
+                if row["MatchedISO"] == "nan":
+                    mapping_dict[row["ISO"]] = "nopop"
+
+            for region in dams_collapse.region.values:
+                    territories.append(mapping_dict[region[:3]])
+
+            dams_collapse = (dams_collapse
+                             .assign_coords({'region':territories})
+                             .groupby('region')
+                             .sum())
+        elif geography == "globe":
+            dams_collapse = dams_collapse.sum(dim="region").assign_coords({'region':'globe'}).expand_dims('region')
+
+        if "gwr" in self.discounting_type:
+            dams_collapse = dams_collapse.assign(
+                ssp=str(list(self.gdp.ssp.values)),
+                model=str(list(self.gdp.model.values)),
+            )
+
+        return dams_collapse.to_dataset(name = 'damages')
 
     def calculated_damages(self):
         pass
