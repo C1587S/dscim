@@ -838,7 +838,11 @@ def prep_mortality_damages(
             if damages[v].dtype == object:
                 damages[v] = damages[v].astype("unicode")
 
+<<<<<<< HEAD
         damages["gcm"] = damages["gcm"].astype("U" + str(max_gcm_len))
+=======
+        damages.coords['gcm'] = damages.coords['gcm'].astype('object')
+>>>>>>> origin/generalize_df_fit
 
         if i == 0:
             damages.to_zarr(
