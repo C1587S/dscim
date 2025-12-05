@@ -85,7 +85,21 @@ class Climate:
 
     @property
     def gmst(self):
-        """Cached GMST anomalies"""
+        """Cached GMST anomalies
+
+        Returns
+        -------
+        pd.DataFrame
+            GMST anomalies as DataFrame (for backward compatibility).
+            For new code, prefer using the xarray-based functions that
+            convert this directly.
+
+        Notes
+        -----
+        This property returns a DataFrame for backward compatibility.
+        The data is loaded from CSV and will be converted to xarray
+        where needed in the processing pipeline.
+        """
         gmst = pd.read_csv(self.gmst_path)
 
         if "temp" in gmst.columns:
@@ -95,7 +109,18 @@ class Climate:
 
     @property
     def gmsl(self):
-        """Cached GMSL anomalies"""
+        """Cached GMSL anomalies
+
+        Returns
+        -------
+        pd.DataFrame
+            GMSL anomalies as DataFrame (for backward compatibility).
+
+        Notes
+        -----
+        This property returns a DataFrame for backward compatibility.
+        Data is loaded from zarr and converted to DataFrame.
+        """
         gmsl = xr.open_zarr(self.gmsl_path).to_dataframe().reset_index()
 
         return gmsl

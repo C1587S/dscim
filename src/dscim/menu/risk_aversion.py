@@ -87,8 +87,15 @@ class RiskAversionRecipe(MainRecipe):
         """Aggregate damages to global level
 
         Returns
-        --------
-            pd.DataFrame
+        -------
+        pd.DataFrame
+            Global damages as DataFrame for compatibility with existing
+            test suite and output pipelines.
+
+        Notes
+        -----
+        Converts from the internal xarray DataArray representation
+        to DataFrame for output.
         """
 
         dams_collapse = (self.calculated_damages * self.collapsed_pop).sum(dim="region")
