@@ -1,11 +1,13 @@
 import warnings
 import logging
+from typing import Union
 import xarray as xr
 import pandas as pd
 import numpy as np
 import statsmodels.formula.api as smf
 import impactlab_tools.utils.weighting
 from itertools import product
+from dscim.utils.compat import ensure_dataframe
 
 logger = logging.getLogger(__name__)
 
@@ -97,15 +99,15 @@ def modeler(df, formula, type_estimation, exog, quantiles=None):
                 q_params.append(params_quantile)
 
                 fitted = pd.DataFrame(dict(exog, y_hat=quant_mod.predict(exog=exog)))
-                #q_y_hat.append(fitted.assign(q=quant))
+                q_y_hat.append(fitted.assign(q=quant))
 
             params = pd.concat(q_params)
-            #y_hat = pd.DataFrame(pd.concat(q_y_hat))
+            y_hat = pd.DataFrame(pd.concat(q_y_hat))
 
     else:
         raise NotImplementedError(f"{type_estimation} is not valid option!")
 
-    return params, None#y_hat
+    return params, y_hat
 
 
 def get_weights(quantiles):
@@ -361,7 +363,7 @@ def c_equivalence(array, dims, eta, weights=None, func_args=None, func=None):
 
 
 def model_outputs(
-    damage_function,
+    damage_function: Union[pd.DataFrame, xr.Dataset],
     extrapolation_type,
     formula,
     year_range,
@@ -386,28 +388,32 @@ def model_outputs(
 
     Parameters
     ----------
-    damage_function: pandas.DataFrame
-        A global damage function.
-    type_estimation: str
+    damage_function : pd.DataFrame or xr.Dataset
+        A global damage function. Can be either DataFrame or xarray Dataset.
+        Will be converted to DataFrame for statsmodels fitting.
+    type_estimation : str
         Type of model use for damage function fitting: `ols`, `quantreg`
     extrapolation_type : str
         Type of extrapolation: `global_c_ratio`
     global_c : xr.DataArray
         Array with global consumption extrapolated to 2300. This is only used
         when ``extrapolation_type`` is ``global_c_ratio``.
-    year_start_pred: int
+    year_start_pred : int
         Start of extrapolation
-    year_range: sequence, lst, tuple, range
+    year_range : sequence, lst, tuple, range
         Range of years to estimate over. Default is 2010 to 2100
 
     Returns
-    ------
-
+    -------
     dict
         dict with two keys, `params` and `preds`. Each value is a Pandas
         DataFrame with yearly damage functions (coefficients and predictions
         respectively).
     """
+
+    # Ensure damage_function is a DataFrame for statsmodels
+    # This handles both DataFrame (pass through) and Dataset (convert) inputs
+    damage_function = ensure_dataframe(damage_function, warn=False)
 
     # set year of prediction for global C extrapolation
     fix_global_c = year_start_pred - 1
@@ -440,20 +446,23 @@ def model_outputs(
             quantiles=quantiles,
         )
 
-        params, y_hat = params.assign(year=year), y_hat.assign(year=year)
+        params = params.assign(year=year)
         list_params.append(params)
-        list_y_hats.append(y_hat)
+        if y_hat is not None:
+            y_hat = y_hat.assign(year=year)
+            list_y_hats.append(y_hat)
 
     # Concatenate results
     param_df = pd.concat(list_params)
-    y_hat_df = pd.concat(list_y_hats)
+    y_hat_df = pd.concat(list_y_hats) if list_y_hats else None
 
     if extrapolation_type == "global_c_ratio":
         # convert to xarray immediately
         index = ["year", "q"] if type_estimation == "quantreg" else ["year"]
-        y_hat_df = y_hat_df.set_index(
-            [i for i in y_hat_df.columns if "y_hat" not in i]
-        ).to_xarray()
+        if y_hat_df is not None:
+            y_hat_df = y_hat_df.set_index(
+                [i for i in y_hat_df.columns if "y_hat" not in i]
+            ).to_xarray()
         param_df = param_df.set_index(index).to_xarray()
 
         # Calculate global consumption ratios to fixed year
@@ -463,11 +472,17 @@ def model_outputs(
         ).squeeze()
 
         # Extrapolate by multiplying fixed params by ratios
-        #extrap_preds = y_hat_df.sel(year=fix_global_c) * global_c_factors
+        if y_hat_df is not None:
+            extrap_preds = y_hat_df.sel(year=fix_global_c) * global_c_factors
+        else:
+            extrap_preds = None
         extrap_params = param_df.sel(year=fix_global_c) * global_c_factors
 
         # concatenate extrapolation and pre-2100
-        #preds = xr.concat([y_hat_df, extrap_preds], dim="year")
+        if extrap_preds is not None:
+            preds = xr.concat([y_hat_df, extrap_preds], dim="year")
+        else:
+            preds = None
         parameters = xr.concat([param_df, extrap_params], dim="year")
 
         # For the local case we don't care about the time dimension, the
@@ -481,7 +496,7 @@ def model_outputs(
     # Return all results
     res = {
         "parameters": parameters,
-        "preds": None,
+        "preds": preds,
     }
 
     return res
