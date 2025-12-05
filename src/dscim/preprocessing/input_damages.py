@@ -526,9 +526,9 @@ def read_energy_files_parallel(input_path, **kwargs):
         df = _parse_projection_filesys(
             input_path=input_path, query=f"exists==True&batch=='batch{i}'"
         )
-        # Calculate the chunk size as an integer
+        # Calculate the chunk size as an integer (minimum 1)
         num_processes = multiprocessing.cpu_count()
-        chunk_size = int(df.shape[0] / num_processes)
+        chunk_size = max(1, int(df.shape[0] / num_processes))
         logger.info(
             f"Starting multiprocessing in {num_processes} cores with {chunk_size} rows each"
         )
