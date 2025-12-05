@@ -1,14 +1,47 @@
 import warnings
 import logging
+from typing import Union
 import xarray as xr
 import pandas as pd
 import numpy as np
 import statsmodels.formula.api as smf
 import impactlab_tools.utils.weighting
 from itertools import product
+from dscim.utils.compat import ensure_dataframe
 
 logger = logging.getLogger(__name__)
 
+
+def fit_project(chunk_reg, formula, type_estimation, quantiles, index_dims):
+    # individual block's mapping function
+    df_reg = chunk_reg.to_dataframe().reset_index()
+
+    year_range = df_reg.year.values
+    
+    df_tot = []
+    for year in year_range:
+        time_window = range(year - 2, year + 3)
+        df = df_reg[df_reg.year.isin(time_window)]
+        params = modeler(
+                df=df,
+                formula=formula,
+                type_estimation=type_estimation,
+                quantiles=quantiles,
+            )
+        params.assign(year = year)
+        df_tot.append(params)
+
+    params = pd.concat(df_tot)
+    for dim in index_dims:
+        if chunk_reg[dim].size == 1:
+            params[dim] = chunk_reg[dim].values
+        else:
+            params[dim] = str(list(chunk_reg[dim].values))
+    
+    print(params, flush=True)
+
+    params = params.set_index(index_dims + ['year',])
+    return(params.to_xarray())
 
 def modeler(df, formula, type_estimation, exog, quantiles=None):
     """Wrapper function for statsmodels functions (OLS and quantiles)
@@ -330,7 +363,7 @@ def c_equivalence(array, dims, eta, weights=None, func_args=None, func=None):
 
 
 def model_outputs(
-    damage_function,
+    damage_function: Union[pd.DataFrame, xr.Dataset],
     extrapolation_type,
     formula,
     year_range,
@@ -355,28 +388,32 @@ def model_outputs(
 
     Parameters
     ----------
-    damage_function: pandas.DataFrame
-        A global damage function.
-    type_estimation: str
+    damage_function : pd.DataFrame or xr.Dataset
+        A global damage function. Can be either DataFrame or xarray Dataset.
+        Will be converted to DataFrame for statsmodels fitting.
+    type_estimation : str
         Type of model use for damage function fitting: `ols`, `quantreg`
     extrapolation_type : str
         Type of extrapolation: `global_c_ratio`
     global_c : xr.DataArray
         Array with global consumption extrapolated to 2300. This is only used
         when ``extrapolation_type`` is ``global_c_ratio``.
-    year_start_pred: int
+    year_start_pred : int
         Start of extrapolation
-    year_range: sequence, lst, tuple, range
+    year_range : sequence, lst, tuple, range
         Range of years to estimate over. Default is 2010 to 2100
 
     Returns
-    ------
-
+    -------
     dict
         dict with two keys, `params` and `preds`. Each value is a Pandas
         DataFrame with yearly damage functions (coefficients and predictions
         respectively).
     """
+
+    # Ensure damage_function is a DataFrame for statsmodels
+    # This handles both DataFrame (pass through) and Dataset (convert) inputs
+    damage_function = ensure_dataframe(damage_function, warn=False)
 
     # set year of prediction for global C extrapolation
     fix_global_c = year_start_pred - 1
@@ -409,20 +446,23 @@ def model_outputs(
             quantiles=quantiles,
         )
 
-        params, y_hat = params.assign(year=year), y_hat.assign(year=year)
+        params = params.assign(year=year)
         list_params.append(params)
-        list_y_hats.append(y_hat)
+        if y_hat is not None:
+            y_hat = y_hat.assign(year=year)
+            list_y_hats.append(y_hat)
 
     # Concatenate results
     param_df = pd.concat(list_params)
-    y_hat_df = pd.concat(list_y_hats)
+    y_hat_df = pd.concat(list_y_hats) if list_y_hats else None
 
     if extrapolation_type == "global_c_ratio":
         # convert to xarray immediately
         index = ["year", "q"] if type_estimation == "quantreg" else ["year"]
-        y_hat_df = y_hat_df.set_index(
-            [i for i in y_hat_df.columns if "y_hat" not in i]
-        ).to_xarray()
+        if y_hat_df is not None:
+            y_hat_df = y_hat_df.set_index(
+                [i for i in y_hat_df.columns if "y_hat" not in i]
+            ).to_xarray()
         param_df = param_df.set_index(index).to_xarray()
 
         # Calculate global consumption ratios to fixed year
@@ -432,11 +472,17 @@ def model_outputs(
         ).squeeze()
 
         # Extrapolate by multiplying fixed params by ratios
-        extrap_preds = y_hat_df.sel(year=fix_global_c) * global_c_factors
+        if y_hat_df is not None:
+            extrap_preds = y_hat_df.sel(year=fix_global_c) * global_c_factors
+        else:
+            extrap_preds = None
         extrap_params = param_df.sel(year=fix_global_c) * global_c_factors
 
         # concatenate extrapolation and pre-2100
-        preds = xr.concat([y_hat_df, extrap_preds], dim="year")
+        if extrap_preds is not None:
+            preds = xr.concat([y_hat_df, extrap_preds], dim="year")
+        else:
+            preds = None
         parameters = xr.concat([param_df, extrap_params], dim="year")
 
         # For the local case we don't care about the time dimension, the
@@ -454,7 +500,6 @@ def model_outputs(
     }
 
     return res
-
 
 def compute_damages(anomaly, betas, formula):
     """Calculate damages using FAIR anomalies (either control or pulse).

@@ -15,6 +15,18 @@ import xarray as xr
 data_dir = "."
 
 
+@pytest.fixture(scope="session", autouse=True)
+def set_compat_mode():
+    """Set default compatibility mode for all tests to 'legacy' for backward compatibility"""
+    # Only set if not already set by user
+    if 'DSCIM_COMPAT_MODE' not in os.environ:
+        os.environ['DSCIM_COMPAT_MODE'] = 'legacy'
+    yield
+    # Clean up after all tests
+    if os.environ.get('DSCIM_COMPAT_MODE') == 'legacy':
+        del os.environ['DSCIM_COMPAT_MODE']
+
+
 @pytest.fixture(scope="module")
 def climate():
     datadir = os.path.join(os.path.dirname(__file__), "data", "climate")

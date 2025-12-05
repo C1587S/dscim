@@ -3,6 +3,7 @@ import logging
 import subprocess
 from subprocess import CalledProcessError
 from abc import ABC, abstractmethod
+from typing import Union
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -18,6 +19,7 @@ from dscim.utils.utils import (
     quantile_weight_quantilereg,
     extrapolate,
 )
+from dscim.utils.compat import get_unique_values
 
 
 class MainRecipe(StackedDamages, ABC):
@@ -107,6 +109,8 @@ class MainRecipe(StackedDamages, ABC):
         extrap_formula=None,
         fair_dims=None,
         save_files=None,
+        geography=None,
+        individual_region=None,
         **kwargs,
     ):
         if scc_quantiles is None:
@@ -194,6 +198,10 @@ class MainRecipe(StackedDamages, ABC):
                 "global_consumption",
                 "global_consumption_no_pulse",
             ]
+            
+        if "country_ISOs" in kwargs:
+            self.countries_mapping = pd.read_csv(kwargs["country_ISOs"])
+            self.countries = self.countries_mapping.MatchedISO.dropna().unique()
 
         super().__init__(
             sector_path=sector_path,
@@ -204,7 +212,10 @@ class MainRecipe(StackedDamages, ABC):
             eta=eta,
             subset_dict=subset_dict,
             ce_path=ce_path,
+            geography=geography,
+            kwargs=kwargs,
         )
+
 
         self.rho = rho
         self.eta = eta
@@ -232,6 +243,8 @@ class MainRecipe(StackedDamages, ABC):
         self.extrap_formula = extrap_formula
         self.fair_dims = fair_dims
         self.save_files = save_files
+        self.geography = geography
+        self.individual_region = individual_region
         self.__dict__.update(**kwargs)
         self.kwargs = kwargs
 
@@ -446,7 +459,7 @@ class MainRecipe(StackedDamages, ABC):
         return meta
 
     @cachedproperty
-    def collapsed_pop(self):
+    def collapsed_pop(self, geography = None):
         """Collapse population according to discount type."""
         if (self.discounting_type == "constant") or ("ramsey" in self.discounting_type):
             pop = self.pop
@@ -454,6 +467,27 @@ class MainRecipe(StackedDamages, ABC):
             pop = self.pop.mean("model")
         elif "gwr" in self.discounting_type:
             pop = self.pop.mean(["model", "ssp"])
+                    
+        if geography == "ir":
+            pass        
+        elif geography == "country":
+            territories = []
+            mapping_dict = {}
+            for ii, row in self.countries_mapping.iterrows():
+                mapping_dict[row["ISO"]] = row["MatchedISO"]
+                if row["MatchedISO"] == "nan":
+                    mapping_dict[row["ISO"]] = "nopop"
+                    
+            for region in dams_collapse.region.values:
+                    territories.append(mapping_dict(region[:3]))
+                    
+            pop = (pop
+                             .assign_coords({'region':territories})
+                             .groupby('region')
+                             .sum())
+        elif geography == "globe":
+            pop = pop.sum(dim="region").assign_coords({'region':'globe'}).expand_dims('region')   
+            
         return pop
 
     @abstractmethod
@@ -484,41 +518,58 @@ class MainRecipe(StackedDamages, ABC):
 
     @cachedproperty
     @save(name="damage_function_points")
-    def damage_function_points(self) -> pd.DataFrame:
+    def damage_function_points(self) -> Union[pd.DataFrame, xr.Dataset]:
         """Global damages by RCP/GCM or SLR
 
         Returns
         --------
-            pd.DataFrame
+        xr.Dataset or pd.DataFrame
+            Dataset containing damage function points with climate variables.
+            Returns DataFrame for backward compatibility if DSCIM_COMPAT_MODE=legacy.
+
+        Notes
+        -----
+        .. versionchanged:: 0.4.0
+            Return type changed from pd.DataFrame to xr.Dataset. Use the
+            compatibility layer functions from dscim.utils.compat for
+            transparent conversion if needed. Set environment variable
+            DSCIM_COMPAT_MODE=legacy for automatic DataFrame conversion.
         """
-        df = self.global_damages_calculation()
+        df = self.damages_calculation(geography = self.geography)
 
-        if "slr" in df.columns:
-            df = df.merge(self.climate.gmsl, on=["year", "slr"])
-        if "gcm" in df.columns:
-            df = df.merge(self.climate.gmst, on=["year", "gcm", "rcp"])
+        climate_vars = []
+        if "slr" in df.coords:
+            climate_vars.append(self.climate.gmsl.set_index(['slr','year']).to_xarray())
+        if "gcm" in df.coords:
+            climate_vars.append(self.climate.gmst.set_index(['gcm','rcp','year']).to_xarray())
 
+        climate_ds = xr.merge(climate_vars)
         # removing illegal combinations from estimation
-        if any([i in df.ssp.unique() for i in ["SSP1", "SSP5"]]):
+        if any([i in df.ssp.values for i in ["SSP1", "SSP5"]]):
             self.logger.info("Dropping illegal model combinations.")
-            for var in [i for i in df.columns if i in ["anomaly", "gmsl"]]:
-                df.loc[
-                    ((df.ssp == "SSP1") & (df.rcp == "rcp85"))
-                    | ((df.ssp == "SSP5") & (df.rcp == "rcp45")),
-                    var,
-                ] = np.nan
+            xr.where(((df.ssp == "SSP1") & (df.rcp == "rcp85"))
+                | ((df.ssp == "SSP5") & (df.rcp == "rcp45")),np.nan,df)
 
         # agriculture lacks ACCESS0-1/rcp85 combo
         if "agriculture" in self.sector:
             self.logger.info("Dropping illegal model combinations for agriculture.")
-            df.loc[(df.gcm == "ACCESS1-0") & (df.rcp == "rcp85"), "anomaly"] = np.nan
+            xr.where((climate_ds.gcm == "ACCESS1-0") & (climate_ds.rcp == "rcp85"), np.nan, climate_ds)
 
+        df = xr.merge([df, climate_ds]).sel(year = df.year)
         return df
+
 
     def damage_function_calculation(self, damage_function_points, global_consumption):
         """The damage function model fit may be : (1) ssp specific, (2) ssp-model specific, (3) unique across ssp-model.
         This depends on the type of discounting. In each case the input data passed to the fitting functions and the formatting of the returned
         output is different because dimensions are different. This function handles this and returns the model fit.
+
+        Parameters
+        ----------
+        damage_function_points : xr.Dataset
+            Damage function points (supports both Dataset and DataFrame via compat layer)
+        global_consumption : xr.DataArray
+            Global consumption data
 
         Returns
         ------
@@ -531,13 +582,13 @@ class MainRecipe(StackedDamages, ABC):
         params_list, preds_list = [], []
 
         if self.discounting_type == "constant_model_collapsed":
-            for ssp in damage_function_points["ssp"].unique():
-                # Subset dataframe to specific SSP
-                fit_subset = damage_function_points[
-                    damage_function_points["ssp"] == ssp
-                ]
+            # Use compatibility function for .unique() that works on both DataFrame and Dataset
+            from dscim.utils.compat import safe_indexing
+            for ssp in get_unique_values(damage_function_points, "ssp"):
+                # Subset using safe_indexing (works for both Dataset and DataFrame)
+                fit_subset = safe_indexing(damage_function_points, damage_function_points['ssp'] == ssp)
 
-                global_c_subset = global_consumption.sel({"ssp": ssp})
+                global_c_subset = safe_indexing(global_consumption, global_consumption.ssp == ssp)
                 # Fit damage function curves using the data subset
                 damage_function = model_outputs(
                     damage_function=fit_subset,
@@ -559,33 +610,34 @@ class MainRecipe(StackedDamages, ABC):
                     )
                 )
 
-                preds = damage_function["preds"].expand_dims(
-                    dict(
-                        discount_type=[self.discounting_type],
-                        ssp=[ssp],
-                        model=[str(list(self.gdp.model.values))],
-                    )
-                )
-
                 params_list.append(params)
-                preds_list.append(preds)
+
+                # Handle preds (may be None if commented out in utils.py)
+                if damage_function["preds"] is not None:
+                    preds = damage_function["preds"].expand_dims(
+                        dict(
+                            discount_type=[self.discounting_type],
+                            ssp=[ssp],
+                            model=[str(list(self.gdp.model.values))],
+                        )
+                    )
+                    preds_list.append(preds)
 
         elif (self.discounting_type == "constant") or (
             "ramsey" in self.discounting_type
         ):
+            # Use compatibility function for getting unique values
             for ssp, model in list(
                 product(
-                    damage_function_points.ssp.unique(),
-                    damage_function_points.model.unique(),
+                    get_unique_values(damage_function_points, "ssp"),
+                    get_unique_values(damage_function_points, "model"),
                 )
             ):
-                # Subset dataframe to specific SSP-IAM combination.
-                fit_subset = damage_function_points[
-                    (damage_function_points["ssp"] == ssp)
-                    & (damage_function_points["model"] == model)
-                ]
+                # Subset using safe_indexing (works for both Dataset and DataFrame)
+                from dscim.utils.compat import safe_indexing
+                fit_subset = safe_indexing(damage_function_points, (damage_function_points['ssp'] == ssp) & (damage_function_points['model'] == model))
 
-                global_c_subset = global_consumption.sel({"ssp": ssp, "model": model})
+                global_c_subset = safe_indexing(global_consumption, (global_consumption.ssp == ssp) & (global_consumption.model == model))
 
                 # Fit damage function curves using the data subset
                 damage_function = model_outputs(
@@ -606,14 +658,16 @@ class MainRecipe(StackedDamages, ABC):
                     )
                 )
 
-                preds = damage_function["preds"].expand_dims(
-                    dict(
-                        discount_type=[self.discounting_type], ssp=[ssp], model=[model]
-                    )
-                )
-
                 params_list.append(params)
-                preds_list.append(preds)
+
+                # Handle preds (may be None if commented out in utils.py)
+                if damage_function["preds"] is not None:
+                    preds = damage_function["preds"].expand_dims(
+                        dict(
+                            discount_type=[self.discounting_type], ssp=[ssp], model=[model]
+                        )
+                    )
+                    preds_list.append(preds)
 
         elif "gwr" in self.discounting_type:
             # Fit damage function across all SSP-IAM combinations, as expected
@@ -641,20 +695,22 @@ class MainRecipe(StackedDamages, ABC):
                 )
             )
 
-            preds = damage_function["preds"].expand_dims(
-                dict(
-                    discount_type=[self.discounting_type],
-                    ssp=[str(list(self.gdp.ssp.values))],
-                    model=[str(list(self.gdp.model.values))],
-                )
-            )
-
             params_list.append(params)
-            preds_list.append(preds)
+
+            # Handle preds (may be None if commented out in utils.py)
+            if damage_function["preds"] is not None:
+                preds = damage_function["preds"].expand_dims(
+                    dict(
+                        discount_type=[self.discounting_type],
+                        ssp=[str(list(self.gdp.ssp.values))],
+                        model=[str(list(self.gdp.model.values))],
+                    )
+                )
+                preds_list.append(preds)
 
         return dict(
             params=xr.combine_by_coords(params_list),
-            preds=xr.combine_by_coords(preds_list),
+            preds=xr.combine_by_coords(preds_list) if preds_list else None,
         )
 
     @cachedproperty
@@ -797,17 +853,42 @@ class MainRecipe(StackedDamages, ABC):
 
     def global_consumption_per_capita(self, disc_type):
         """Global consumption per capita
-
+    
         Returns
         -------
             xr.DataArray
         """
-
+    
         # Calculate global consumption per capita
         array_pc = self.global_consumption_calculation(
             disc_type
-        ) / self.collapsed_pop.sum("region")
+        )
+        
+        if self.geography == "ir":
+            array_pc = array_pc / self.collapsed_pop
+        elif self.geography == "country":
+            territories = []
+            mapping_dict = {}
+            for ii, row in self.countries_mapping.iterrows():
+                mapping_dict[row["ISO"]] = row["MatchedISO"]
+                if row["MatchedISO"] == "nan":
+                    mapping_dict[row["ISO"]] = "nopop"
 
+            for region in array_pc.region.values:
+                    territories.append(mapping_dict[region[:3]])
+
+            pop = (self.collapsed_pop
+                       .assign_coords({'region':territories})
+                       .groupby('region')
+                       .sum())
+
+            array_pc = (array_pc / pop)
+        elif self.geography == "globe":
+            array_pc = (array_pc / self.collapsed_pop.sum("region")).assign_coords({'region':'globe'}).expand_dims('region')
+        elif self.geography is None:
+            # For backward compatibility, treat None geography like globe
+            array_pc = array_pc / self.collapsed_pop.sum("region")   
+    
         if self.NAME == "equity":
             # equity recipe's growth is capped to
             # risk aversion recipe's growth rates
@@ -819,7 +900,7 @@ class MainRecipe(StackedDamages, ABC):
                 method="growth_constant",
                 cap=self.risk_aversion_growth_rates(),
             )
-
+    
         else:
             extrapolated = extrapolate(
                 xr_array=array_pc,
@@ -828,9 +909,9 @@ class MainRecipe(StackedDamages, ABC):
                 interp_year=self.ext_end_year,
                 method="growth_constant",
             )
-
+    
         complete_array = xr.concat([array_pc, extrapolated], dim="year")
-
+    
         return complete_array
 
     @cachedproperty
@@ -838,25 +919,47 @@ class MainRecipe(StackedDamages, ABC):
     def global_consumption(self):
         """Global consumption without climate change"""
 
+        individual_region = self.individual_region
+        
         # rff simulation means that GDP already exists out to 2300
         if 2300 in self.gdp.year:
             self.logger.debug("Global consumption found up to 2300.")
-            global_cons = self.gdp.sum("region").rename("global_consumption")
+            if individual_region is not None:
+                global_cons = self.gdp.sel(region = individual_region,drop=True).rename("global_consumption")
+            else:
+                global_cons = self.gdp.sum("region").rename("global_consumption")
         else:
             self.logger.info("Extrapolating global consumption.")
 
             # holding population constant
             # from 2100 to 2300 with 2099 values
-            pop = self.collapsed_pop.sum("region")
+            if individual_region is None:
+                pop = self.collapsed_pop
+                if self.geography == "ir":
+                    pass
+                elif self.geography == "country":
+                    pass
+                elif self.geography == "globe":
+                    pop = pop.sum("region")
+                elif self.geography is None:
+                    # For backward compatibility, treat None geography like globe
+                    pop = pop.sum("region")
+            else:
+                pop = self.collapsed_pop.sel(region = individual_region, drop=True)
             pop = pop.reindex(
                 year=range(pop.year.min().values, self.ext_end_year + 1),
                 method="ffill",
             )
 
             # Calculate global consumption back by
-            global_cons = (
-                self.global_consumption_per_capita(self.discounting_type) * pop
-            )
+            if individual_region is None:
+                global_cons = (
+                    self.global_consumption_per_capita(self.discounting_type) * pop
+                )
+            else:
+                global_cons = (
+                    self.global_consumption_per_capita(self.discounting_type).sel(region = individual_region,drop=True) * pop
+                )
 
         # Add dimension
         # @TODO: remove this line altogether
@@ -964,18 +1067,25 @@ class MainRecipe(StackedDamages, ABC):
     @save(name="global_consumption_no_pulse")
     def global_consumption_no_pulse(self):
         """Global consumption under FAIR control scenario."""
-
+        individual_region = self.individual_region
         fair_control = self.climate.fair_control
 
         if self.clip_gmsl:
             fair_control["gmsl"] = np.minimum(fair_control["gmsl"], self.gmsl_max)
 
-        damages = compute_damages(
-            fair_control,
-            betas=self.damage_function_coefficients,
-            formula=self.formula,
-        )
-
+        if individual_region is not None:
+            damages = compute_damages(
+                fair_control,
+                betas=self.damage_function_coefficients.sel(region = individual_region),
+                formula=self.formula,
+            )
+        else:
+            damages = compute_damages(
+                fair_control,
+                betas=self.damage_function_coefficients,
+                formula=self.formula,
+            )
+            
         cc_cons = self.global_consumption - damages
 
         gc_no_pulse = []
@@ -995,18 +1105,25 @@ class MainRecipe(StackedDamages, ABC):
     @save(name="global_consumption_pulse")
     def global_consumption_pulse(self):
         """Global consumption under FAIR pulse scenario."""
-
+        individual_region = self.individual_region
         fair_pulse = self.climate.fair_pulse
 
         if self.clip_gmsl:
             fair_pulse["gmsl"] = np.minimum(fair_pulse["gmsl"], self.gmsl_max)
 
-        damages = compute_damages(
-            fair_pulse,
-            betas=self.damage_function_coefficients,
-            formula=self.formula,
-        )
-
+        if individual_region is not None:
+            damages = compute_damages(
+                fair_pulse,
+                betas=self.damage_function_coefficients.sel(region = individual_region),
+                formula=self.formula,
+            )
+        else:
+            damages = compute_damages(
+                fair_pulse,
+                betas=self.damage_function_coefficients,
+                formula=self.formula,
+            )
+    
         cc_cons = self.global_consumption - damages
         gc_no_pulse = []
         for wp in self.weitzman_parameter:

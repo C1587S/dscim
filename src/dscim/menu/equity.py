@@ -3,6 +3,8 @@ import xarray as xr
 import numpy as np
 from dscim.utils.utils import c_equivalence
 from dscim.menu.main_recipe import MainRecipe
+from dscim.descriptors import cachedproperty
+from dscim.menu.decorators import save
 
 
 class EquityRecipe(MainRecipe):
@@ -60,7 +62,56 @@ class EquityRecipe(MainRecipe):
     def calculated_damages(self) -> xr.DataArray:
         return self.ce_no_cc - self.ce_cc
 
+    @cachedproperty
+    @save(name="damage_function_points")
+    def damage_function_points(self) -> pd.DataFrame:
+        """Global damages by RCP/GCM or SLR
+
+        EquityRecipe overrides the base implementation to maintain
+        DataFrame-based workflow, avoiding unnecessary conversions.
+
+        Returns
+        --------
+            pd.DataFrame
+        """
+        df = self.global_damages_calculation()
+
+        if "slr" in df.columns:
+            df = df.merge(self.climate.gmsl, on=["year", "slr"])
+        if "gcm" in df.columns:
+            df = df.merge(self.climate.gmst, on=["year", "gcm", "rcp"])
+
+        # removing illegal combinations from estimation
+        if any([i in df.ssp.unique() for i in ["SSP1", "SSP5"]]):
+            self.logger.info("Dropping illegal model combinations.")
+            for var in [i for i in df.columns if i in ["anomaly", "gmsl"]]:
+                df.loc[
+                    ((df.ssp == "SSP1") & (df.rcp == "rcp85"))
+                    | ((df.ssp == "SSP5") & (df.rcp == "rcp45")),
+                    var,
+                ] = np.nan
+
+        # agriculture lacks ACCESS0-1/rcp85 combo
+        if "agriculture" in self.sector:
+            self.logger.info("Dropping illegal model combinations for agriculture.")
+            df.loc[(df.gcm == "ACCESS1-0") & (df.rcp == "rcp85"), "anomaly"] = np.nan
+
+        return df
+
     def global_damages_calculation(self) -> pd.DataFrame:
+        """Aggregate damages to global level with equity weighting
+
+        Returns
+        -------
+        pd.DataFrame
+            Global damages as DataFrame for compatibility with existing
+            test suite and output pipelines.
+
+        Notes
+        -----
+        Converts from the internal xarray DataArray representation
+        to DataFrame for output.
+        """
         dams_collapse = self.calculated_damages * self.collapsed_pop.sum(dim="region")
         df = dams_collapse.to_dataframe("damages").reset_index()
 

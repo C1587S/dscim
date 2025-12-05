@@ -85,7 +85,21 @@ class Climate:
 
     @property
     def gmst(self):
-        """Cached GMST anomalies"""
+        """Cached GMST anomalies
+
+        Returns
+        -------
+        pd.DataFrame
+            GMST anomalies as DataFrame (for backward compatibility).
+            For new code, prefer using the xarray-based functions that
+            convert this directly.
+
+        Notes
+        -----
+        This property returns a DataFrame for backward compatibility.
+        The data is loaded from CSV and will be converted to xarray
+        where needed in the processing pipeline.
+        """
         gmst = pd.read_csv(self.gmst_path)
 
         if "temp" in gmst.columns:
@@ -95,8 +109,19 @@ class Climate:
 
     @property
     def gmsl(self):
-        """Cached GMSL anomalies"""
-        gmsl = xr.open_zarr(self.gmsl_path).gmsl.to_dataframe().reset_index()
+        """Cached GMSL anomalies
+
+        Returns
+        -------
+        pd.DataFrame
+            GMSL anomalies as DataFrame (for backward compatibility).
+
+        Notes
+        -----
+        This property returns a DataFrame for backward compatibility.
+        Data is loaded from zarr and converted to DataFrame.
+        """
+        gmsl = xr.open_zarr(self.gmsl_path).to_dataframe().reset_index()
 
         return gmsl
 
@@ -306,7 +331,12 @@ class StackedDamages:
         histclim=None,
         ce_path=None,
         subset_dict=None,
+        geography=None,
+        **kwargs,
     ):
+        if geography is None:
+            geography = "global"
+
         self.sector_path = sector_path
         self.save_path = save_path
         self.gdppc_bottom_code = gdppc_bottom_code
@@ -317,7 +347,15 @@ class StackedDamages:
         self.histclim = histclim
         self.ce_path = ce_path
         self.eta = eta
+        self.__dict__.update(**kwargs)
+        self.geography = geography
+        self.kwargs = kwargs
 
+        if "country_ISOs" in kwargs:
+            self.countries_mapping = pd.read_csv(kwargs["country_ISOs"])
+            self.countries = self.countries_mapping.MatchedISO.dropna().unique()
+
+            
         self.logger = logging.getLogger(__name__)
 
     def cut(self, xr_array, end_year=2099):
@@ -351,7 +389,41 @@ class StackedDamages:
         )
 
         return xr_data
+    
+    @property
+    def geography_collapsed_econ_vars(self):
+        
+        pop_collapse = self.pop
+                
+        if self.geography == "ir":
+            pass
+        elif self.geography == "country":
+            territories = []
+            mapping_dict = {}
+            for ii, row in self.countries_mapping.iterrows():
+                mapping_dict[row["ISO"]] = row["MatchedISO"]
+                if row["MatchedISO"] == "nan":
+                    mapping_dict[row["ISO"]] = "nopop"
+                    
+            for region in pop_collapse.region.values:
+                    territories.append(mapping_dict(region[:3]))
+                    
+            pop_collapse = (pop_collapse
+                             .assign_coords({'region':territories})
+                             .groupby('region')
+                             .sum())
+        elif self.geography == "global":
+            pop_collapse = pop_collapse.sum(dim="region").assign_coords({'region':'globe'}).expand_dims('region')   
 
+        if "gwr" in self.discounting_type:
+            pop_collapse = pop_collapse.assign(
+                ssp=str(list(self.gdp.ssp.values)),
+                model=str(list(self.gdp.model.values)),
+            )
+
+        return pop_collapse.to_dataset(name = 'damages')
+
+        
     @property
     def cut_econ_vars(self):
         """Economic variables from SSP object"""
@@ -384,9 +456,9 @@ class StackedDamages:
     def adding_up_damages(self):
         """This property calls pre-calculated adding-up IR-level 'mean' over batches."""
 
-        mean_cc = f"{self.ce_path}/adding_up_cc.zarr"
-        mean_no_cc = f"{self.ce_path}/adding_up_no_cc.zarr"
-
+        mean_cc = f"{self.ce_path}/adding_up_cc_eta{self.eta}.zarr"
+        mean_no_cc = f"{self.ce_path}/adding_up_no_cc_eta{self.eta}.zarr"
+        
         if os.path.exists(mean_cc) and os.path.exists(mean_no_cc):
             self.logger.info(
                 f"Adding up aggregated damages found at {mean_cc}, {mean_no_cc}. These are being loaded..."
