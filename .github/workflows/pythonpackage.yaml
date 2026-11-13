@@ -1,71 +1,87 @@
 name: Python package
 
 on:
-  pull_request:
   push:
     branches:
-      - main
-
+      - ci-diagnose-cpu
+  workflow_dispatch:
 
 jobs:
 
-  codequality:
+  diagnose:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        variant: ["default", "no-avx512", "single-thread"]
+    env:
+      NPY_DISABLE_CPU_FEATURES: ${{ matrix.variant == 'no-avx512' && 'AVX512F AVX512CD AVX512_KNL AVX512_KNM AVX512_SKX AVX512_CLX AVX512_CNL AVX512_ICL' || '' }}
+      OMP_NUM_THREADS: ${{ matrix.variant == 'single-thread' && '1' || '' }}
+      OPENBLAS_NUM_THREADS: ${{ matrix.variant == 'single-thread' && '1' || '' }}
+      MKL_NUM_THREADS: ${{ matrix.variant == 'single-thread' && '1' || '' }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.12
         uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
           cache: 'pip'
           cache-dependency-path: 'requirements.txt'
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Install package
-        run: |
-          pip install . --no-deps
-      - name: Format check with ruff
-        run: |
-          ruff format . --diff
-      - name: Lint check with ruff
-        run: |
-          ruff check . --output-format=github
-
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.12"]
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: 'pip'
-          cache-dependency-path: 'requirements.txt'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Install package
-        run: |
           pip install .
-      - name: Test with pytest
+      - name: Runner hardware and numpy dispatch
         run: |
-          pytest -v --cov dscim --cov-report term-missing --cov-report xml
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          grep -m1 "model name" /proc/cpuinfo
+          nproc
+          grep -m1 -o -w "avx512f\|avx512_skx\|avx512bw" /proc/cpuinfo | sort -u || echo "no avx512 flags"
+          ldd --version | head -1
+          echo "NPY_DISABLE_CPU_FEATURES=[$NPY_DISABLE_CPU_FEATURES] OMP_NUM_THREADS=[$OMP_NUM_THREADS]"
+          python - <<'PY'
+          import numpy as np
+          from numpy.core._multiarray_umath import __cpu_features__ as f, __cpu_dispatch__ as d
+          print("numpy", np.__version__, "enabled dispatch:", [k for k in d if f.get(k)])
+          PY
+      - name: Fingerprint certainty-equivalent points
+        run: |
+          python - <<'PY'
+          import hashlib, os, zipfile
+          import numpy as np, pandas as pd, dask
+          from pandas.testing import assert_frame_equal
+          dask.config.set(scheduler="single-threaded")
+          from dscim.menu.simple_storage import Climate, EconVars
+          from dscim.menu.equity import EquityRecipe
+          from dscim.menu.risk_aversion import RiskAversionRecipe
+          datadir = "tests/data"; cdir = os.path.join(datadir, "climate")
+          climate = Climate(gmsl_path="./gmsl.csv", gmst_path=os.path.join(cdir, "gmst.csv"),
+              gmst_fair_path=os.path.join(cdir, "fair_temps_sims.nc4"), gmsl_fair_path=os.path.join(cdir, "fair_slr_sims.nc4"),
+              damages_pulse_conversion_path=os.path.join(cdir, "scenario_rcp45-rcp85-ssp245-ssp460-ssp370_CO2_Fossil-CH4-N2O_conversion_pulseyears_2020-2100_5yrincrements_v3.0_newformat.nc"),
+              ecs_mask_path=None, ecs_mask_name=None, pulse_year=2020, base_period=[2001, 2010],
+              emission_scenarios=["ssp370"], gases=["CO2_Fossil", "CH4", "N2O"])
+          econ = EconVars(path_econ=os.path.join(datadir, "zarrs", "all_ssps.zarr"))
+          idx = ["model", "ssp", "rcp", "gcm", "year"]
+          for cls, disc, prefix in ((EquityRecipe, "constant", "equity"), (RiskAversionRecipe, "euler_gwr", "risk_aversion")):
+              m = cls(sector_path=[{"dummy_sector": os.path.join(datadir, "damages")}], save_path=None, discrete_discounting=True,
+                  econ_vars=econ, climate_vars=climate, fit_type="ols", variable=[{"dummy_sector": "damages"}], sector="dummy_sector",
+                  discounting_type=disc, ext_method="global_c_ratio", save_files=[], ce_path=os.path.join(datadir, "CEs"),
+                  subset_dict={"ssp": ["SSP2", "SSP3", "SSP4"], "region": ["IND.21.317.1249", "CAN.2.33.913", "USA.14.608", "EGY.11",
+                      "SDN.4.11.50.164", "NGA.25.510", "SAU.7", "RUS.16.430.430", "SOM.2.5"]},
+                  formula="damages ~ -1 + anomaly + np.power(anomaly, 2)", extrap_formula=None,
+                  fair_aggregation=["median_params", "ce", "mean"], weitzman_parameter=[0.1])
+              actual = m.damage_function_points.set_index(idx)
+              with zipfile.ZipFile(os.path.join(datadir, "menu_results.zip")).open(f"menu_results/{prefix}_{disc}_eta{m.eta}_rho{m.rho}_damage_function_points.csv") as fh:
+                  exp = pd.read_csv(fh).set_index(idx)
+              a = actual.reindex(exp.index)["damages"].to_numpy("float64"); e = exp["damages"].to_numpy("float64")
+              ok = np.isfinite(a) & np.isfinite(e); rel = np.abs(a[ok] - e[ok]) / np.maximum(np.abs(e[ok]), 1e-300)
+              try: assert_frame_equal(exp, actual, rtol=1e-4, atol=1e-4, check_like=True); passed = True
+              except AssertionError: passed = False
+              print(f"{prefix}/{disc}: sha256={hashlib.sha256(a.tobytes()).hexdigest()[:16]} max_rel_diff_vs_expected={rel.max():.3e} test_assertion_passes={passed}")
+          PY
+      - name: Run the five intermittent tests
+        run: |
+          pytest -q tests/test_equity.py::test_equity_points tests/test_equity.py::test_equity_coefficients tests/test_equity.py::test_equity_fit tests/test_risk_aversion.py::test_risk_aversion_coefficients tests/test_risk_aversion.py::test_risk_aversion_fit
