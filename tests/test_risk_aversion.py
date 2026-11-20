@@ -15,11 +15,13 @@ def test_risk_aversion_points(menu_instance, discount_types):
     idx = ["model", "ssp", "rcp", "gcm", "year"]
     expected = open_zipped_results(path).set_index(idx)
     actual = menu_instance.damage_function_points.set_index(idx)
+    # rtol and atol are 10x the largest deviation from this fixture measured with
+    # numpy's AVX512 code paths. atol is 5.1e-4 of the median absolute damage (2.0e10).
     assert_frame_equal(
         expected,
         actual,
-        rtol=1e-4,
-        atol=1e-4,
+        rtol=6e-4,
+        atol=1e7,
         check_like=True,
     )
 
@@ -29,9 +31,14 @@ def test_risk_aversion_coefficients(menu_instance, discount_types):
     path = f"risk_aversion_{discount_types}_eta{menu_instance.eta}_rho{menu_instance.rho}_damage_function_coefficients.nc4"
     expected = open_zipped_results(path)
     actual = menu_instance.damage_function_coefficients
+    # rtol and atol are 10x the largest deviation from this fixture measured with
+    # numpy's AVX512 code paths. atol is 2.0e-5 to 2.8e-5 of the median absolute
+    # coefficient (3.6e10 to 5.0e10).
     assert_allclose(
         expected.transpose(*sorted(expected.dims)).sortby(list(expected.dims)),
         actual.transpose(*sorted(actual.dims)).sortby(list(actual.dims)),
+        rtol=9e-6,
+        atol=1e6,
     )
 
 
@@ -40,9 +47,14 @@ def test_risk_aversion_fit(menu_instance, discount_types):
     path = f"risk_aversion_{discount_types}_eta{menu_instance.eta}_rho{menu_instance.rho}_damage_function_fit.nc4"
     expected = open_zipped_results(path)
     actual = menu_instance.damage_function_fit
+    # rtol and atol are 10x the largest deviation from this fixture measured with
+    # numpy's AVX512 code paths. atol is 1.1e-4 of the median absolute fitted value
+    # (3.7e12).
     assert_allclose(
         expected.transpose(*sorted(expected.dims)).sortby(list(expected.dims)),
         actual.transpose(*sorted(actual.dims)).sortby(list(actual.dims)),
+        rtol=7e-5,
+        atol=4e8,
     )
 
 
