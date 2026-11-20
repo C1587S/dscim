@@ -15,11 +15,13 @@ def test_equity_points(menu_instance, discount_types):
     idx = ["model", "ssp", "rcp", "gcm", "year"]
     expected = open_zipped_results(path).set_index(idx)
     actual = menu_instance.damage_function_points.set_index(idx)
+    # rtol and atol are 10x the largest deviation from this fixture measured with
+    # numpy's AVX512 code paths. atol is 7.6e-4 of the median absolute damage (2.6e10).
     assert_frame_equal(
         expected,
         actual,
-        rtol=1e-4,
-        atol=1e-4,
+        rtol=3e-4,
+        atol=2e7,
         check_like=True,
     )
 
@@ -29,9 +31,14 @@ def test_equity_coefficients(menu_instance, discount_types):
     path = f"equity_{discount_types}_eta{menu_instance.eta}_rho{menu_instance.rho}_damage_function_coefficients.nc4"
     expected = open_zipped_results(path)
     actual = menu_instance.damage_function_coefficients
+    # rtol and atol are 10x the largest deviation from this fixture measured with
+    # numpy's AVX512 code paths. atol is 9.6e-6 to 1.2e-5 of the median absolute
+    # coefficient (6.6e10 to 8.3e10).
     assert_allclose(
         expected.transpose(*sorted(expected.dims)).sortby(list(expected.dims)),
         actual.transpose(*sorted(actual.dims)).sortby(list(actual.dims)),
+        rtol=5e-6,
+        atol=8e5,
     )
 
 
@@ -40,9 +47,14 @@ def test_equity_fit(menu_instance, discount_types):
     path = f"equity_{discount_types}_eta{menu_instance.eta}_rho{menu_instance.rho}_damage_function_fit.nc4"
     expected = open_zipped_results(path)
     actual = menu_instance.damage_function_fit
+    # rtol and atol are 10x the largest deviation from this fixture measured with
+    # numpy's AVX512 code paths. atol is 4.1e-5 of the median absolute fitted value
+    # (4.9e12).
     assert_allclose(
         expected.transpose(*sorted(expected.dims)).sortby(list(expected.dims)),
         actual.transpose(*sorted(actual.dims)).sortby(list(actual.dims)),
+        rtol=3e-5,
+        atol=2e8,
     )
 
 
